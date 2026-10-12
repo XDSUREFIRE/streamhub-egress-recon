@@ -8,7 +8,9 @@ import { createHash, createDecipheriv } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
-const MAX_MANIFEST = 1024 * 1024;
+// Gateway rewrites every URI to a signed capability; that expansion makes a
+// valid sub-1MiB upstream playlist larger. Keep the rewritten response bounded.
+const MAX_MANIFEST = 8 * 1024 * 1024;
 const MAX_SEGMENT = 16 * 1024 * 1024;
 const SAFE_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'access-control-allow-origin',
   'access-control-allow-methods', 'cache-control', 'server', 'cf-ray'];
@@ -158,7 +160,7 @@ async function transportProof(source, origin) {
   const entries = parseVariant(variant.body.toString('utf8'), variants[0].url, origin);
   const selected = entries.filter((entry, index, all) => all.findIndex(other => other.url === entry.url) === index).slice(0, 3);
   if (selected.length !== 3) fail('THREE_DISTINCT_SEGMENTS_REQUIRED');
-  const keys = new Map(), maps = new Set();
+  const keys = new Map(), maps = new Set(), segmentHashes = new Set();
   for (const [index, entry] of selected.entries()) {
     if (entry.byteRange) fail('BYTE_RANGE_CANNOT_MEET_THREE_HTTP_200_RULE');
     if (entry.map && !maps.has(entry.map.url)) {
@@ -195,11 +197,14 @@ async function transportProof(source, origin) {
       } catch { fail('AES_SEGMENT_DECODE_FAILED'); }
     }
     const detected = inspectMedia(bytes);
+    const decodedSha256 = createHash('sha256').update(bytes).digest('hex');
     const valid = detected.format === 'MPEG-TS' || (detected.format === 'fMP4' && entry.map && maps.has(entry.map.url));
     proof.segments.push({ number: index + 1, status: fetched.status, wireBytes: fetched.bytes, decodedBytes: bytes.length,
-      encrypted: Boolean(entry.key), prefixHex: bytes.subarray(0, 16).toString('hex'), ...detected, passed: Boolean(valid) });
+      decodedSha256, encrypted: Boolean(entry.key), prefixHex: bytes.subarray(0, 16).toString('hex'), ...detected, passed: Boolean(valid) });
     if (!valid) fail(`SEGMENT_${index + 1}_INVALID_MEDIA_BYTES`);
+    segmentHashes.add(decodedSha256);
   }
+  if (segmentHashes.size !== 3) fail('THREE_DISTINCT_SEGMENT_BYTES_REQUIRED');
   proof.passed = true;
   } catch (error) { proof.reason = error instanceof ProofError ? error.code : 'TRANSPORT_VALIDATION_FAILED'; }
   return proof;
