@@ -20,6 +20,39 @@ const fail = code => { throw new ProofError(code); };
 const safeCode = value => /^[A-Z0-9_:-]{1,120}$/i.test(String(value)) ? String(value) : 'REMOTE_VALIDATION_ERROR';
 const headersProof = headers => Object.fromEntries(SAFE_HEADERS.filter(key => headers[key] !== undefined).map(key => [key, String(headers[key])]));
 
+export function normalizeTestOptions({ quality = 'lowest', seconds = 3 } = {}) {
+  if (!['lowest', 'highest'].includes(quality)) fail('INVALID_TEST_QUALITY');
+  if (!/^(?:[3-9]|[1-5]\d|60)$/.test(String(seconds))) fail('INVALID_TEST_SECONDS');
+  return { quality, seconds: Number(seconds) };
+}
+
+function dimensions(variant) {
+  const pair = /^([1-9]\d{0,4})x([1-9]\d{0,4})$/.exec(variant.resolution || '');
+  const width = Number(variant.width || pair?.[1]) || null;
+  const height = Number(variant.height || pair?.[2]) || null;
+  return { width, height, area: width && height ? width * height : 0 };
+}
+
+export function selectVariant(variants, quality = 'lowest') {
+  if (!['lowest', 'highest'].includes(quality) || !Array.isArray(variants) || !variants.length) fail('INVALID_VARIANT_SELECTION');
+  const bitrate = variant => Number(variant.bandwidth ?? variant.bitrate) > 0 ? Number(variant.bandwidth ?? variant.bitrate) : 0;
+  return [...variants].sort((first, second) => quality === 'highest'
+    ? dimensions(second).area - dimensions(first).area || bitrate(second) - bitrate(first)
+    : (bitrate(first) || Number.MAX_SAFE_INTEGER) - (bitrate(second) || Number.MAX_SAFE_INTEGER))[0];
+}
+
+export function evaluateDecodedProof(proof, { quality = 'lowest', seconds = 3, expected = {} } = {}) {
+  const required = normalizeTestOptions({ quality, seconds });
+  const hasExpected = Number(expected.width) > 0 && Number(expected.height) > 0;
+  return Boolean(!proof.fatal && !proof.qualityFallback && !proof.frameResolutionMismatch && !proof.timelineDiscontinuity &&
+    proof.frameCallbacks >= 20 && proof.decodedSeconds >= required.seconds && proof.decodedWallSeconds >= required.seconds - 0.25 &&
+    proof.width > 0 && proof.height > 0 && proof.manualQualityLocked === true && proof.selectedLevel &&
+    (!(expected.bandwidth > 0) || proof.selectedLevel.bandwidth === expected.bandwidth) &&
+    (!hasExpected || (proof.selectedLevel.width === expected.width && proof.selectedLevel.height === expected.height)) &&
+    (!hasExpected || (proof.width === expected.width && proof.height === expected.height && proof.frameDimensionsMatch === true)) &&
+    (quality !== 'highest' || hasExpected));
+}
+
 function httpsUrl(value, base) {
   let url;
   try { url = new URL(value, base); } catch { fail('INVALID_HTTPS_URL'); }
@@ -71,12 +104,13 @@ export function parseMaster(text, base, origin) {
       const attrs = attributes(lines[index]);
       const next = lines.slice(index + 1).find(line => line && !line.startsWith('#'));
       if (!next) fail('MISSING_VARIANT_URI');
-      choices.push({ url: mediaUrl(next, base, origin), bandwidth: Number(attrs.BANDWIDTH) || Number.MAX_SAFE_INTEGER,
-        resolution: /^\d+x\d+$/.test(attrs.RESOLUTION || '') ? attrs.RESOLUTION : null });
+      const resolution = /^\d+x\d+$/.test(attrs.RESOLUTION || '') ? attrs.RESOLUTION : null;
+      choices.push({ url: mediaUrl(next, base, origin), bandwidth: Number(attrs.BANDWIDTH) || Number(attrs['AVERAGE-BANDWIDTH']) || 0,
+        resolution, ...dimensions({ resolution }) });
     }
   }
   if (!choices.length) fail('MASTER_HAS_NO_VARIANTS');
-  return choices.sort((a, b) => a.bandwidth - b.bandwidth);
+  return choices.sort((a, b) => (a.bandwidth || Number.MAX_SAFE_INTEGER) - (b.bandwidth || Number.MAX_SAFE_INTEGER));
 }
 
 export function parseVariant(text, base, origin) {
@@ -148,16 +182,19 @@ async function egressProof() {
   return { ip, asns: data.asns.map(Number), prefix: data.prefix, ipStatus: response.status, asnStatus: lookup.status, forcedIpv4: true };
 }
 
-async function transportProof(source, origin) {
-  const proof = { passed: false, http: [], selectedVariant: null, segments: [], encryption: [], initialization: [] };
+async function transportProof(source, origin, quality) {
+  const proof = { passed: false, http: [], availableVariants: [], selectedVariant: null, segments: [], encryption: [], initialization: [] };
   try {
   const master = await recordFetch('master', source, proof);
   if (master.status !== 200) fail('MASTER_NOT_200');
   const variants = parseMaster(master.body.toString('utf8'), source, origin);
-  proof.selectedVariant = { bandwidth: variants[0].bandwidth, resolution: variants[0].resolution, choice: 'lowest-bandwidth', count: variants.length };
-  const variant = await recordFetch('variant', variants[0].url, proof);
+  const selection = selectVariant(variants, quality);
+  proof.availableVariants = variants.map(({ bandwidth, resolution, width, height }) => ({ bandwidth, resolution, width, height }));
+  proof.selectedVariant = { bandwidth: selection.bandwidth, resolution: selection.resolution, width: selection.width, height: selection.height,
+    choice: quality === 'highest' ? 'highest-pixel-area-then-bandwidth' : 'lowest-bandwidth', count: variants.length };
+  const variant = await recordFetch('variant', selection.url, proof);
   if (variant.status !== 200) fail('VARIANT_NOT_200');
-  const entries = parseVariant(variant.body.toString('utf8'), variants[0].url, origin);
+  const entries = parseVariant(variant.body.toString('utf8'), selection.url, origin);
   const selected = entries.filter((entry, index, all) => all.findIndex(other => other.url === entry.url) === index).slice(0, 3);
   if (selected.length !== 3) fail('THREE_DISTINCT_SEGMENTS_REQUIRED');
   const keys = new Map(), maps = new Set(), segmentHashes = new Set();
@@ -228,27 +265,52 @@ async function exposureProof(origin) {
 const PLAYER_HTML = `<!doctype html><meta charset="utf-8"><title>StreamHub remote playback proof</title>
 <style>body{margin:0;background:#101018;color:#f5f5fa;font:16px system-ui;padding:24px}video{display:block;width:min(960px,100%);background:#000}h1{font-size:22px}#status{margin-top:16px}</style>
 <h1>StreamHub — different-network playback proof</h1><video id="video" muted playsinline controls></video><p id="status">Waiting for a protected media source.</p><script src="/hls.min.js"></script><script>
-window.proof={frameCallbacks:0,firstMediaTime:null,lastMediaTime:null,decodedSeconds:0,width:0,height:0,fatal:null,passed:false};
-window.startValidation=async function(source){
+window.proof={frameCallbacks:0,firstMediaTime:null,lastMediaTime:null,decodedSeconds:0,decodedWallSeconds:0,width:0,height:0,videoWidth:0,videoHeight:0,fatal:null,passed:false,selectedLevel:null,manualQualityLocked:false,frameResolutionMismatch:false,frameDimensionsMatch:false,qualityFallback:false,timelineDiscontinuity:false,maxMediaTimeGap:0,waitingEvents:0,waitingSeconds:0,droppedFrames:0,totalVideoFrames:0};
+window.startValidation=async function(input){
+ const {source,quality,seconds,expected}=input;
  const video=document.querySelector('video'),status=document.querySelector('#status');
  if(!Hls.isSupported()||!video.requestVideoFrameCallback)throw new Error('BROWSER_DECODE_API_UNAVAILABLE');
- const hls=new Hls({autoStartLoad:false,startLevel:0,minAutoBitrate:0,maxBufferLength:8,maxMaxBufferLength:12,maxBufferSize:4194304,backBufferLength:0,enableWorker:true});
- window.hls=hls;hls.autoLevelCapping=0;
+ const hls=new Hls({autoStartLoad:false,startLevel:0,minAutoBitrate:0,maxBufferLength:8,maxMaxBufferLength:12,maxBufferSize:16777216,backBufferLength:0,enableWorker:true});
+ window.hls=hls;window.proof.quality=quality;window.proof.requiredSeconds=seconds;window.proof.expectedDimensions={width:expected.width,height:expected.height};
+ let lockedLevel=null,firstFrameWall=null,waitingAt=null;
+ const startedWall=performance.now();
+ function fatal(details){window.proof.fatal={type:'quality-proof',details};status.textContent='Playback proof failed: '+details;video.pause();hls.stopLoad();}
+ function finishWaiting(){if(waitingAt!==null){window.proof.waitingSeconds+=(performance.now()-waitingAt)/1000;waitingAt=null;}}
+ video.addEventListener('waiting',()=>{window.proof.waitingEvents++;if(waitingAt===null)waitingAt=performance.now();});
+ video.addEventListener('playing',finishWaiting);
+ window.snapshotProof=function(){finishWaiting();const stats=video.getVideoPlaybackQuality();window.proof.droppedFrames=stats.droppedVideoFrames;window.proof.totalVideoFrames=stats.totalVideoFrames;window.proof.wallSeconds=(performance.now()-startedWall)/1000;return {...window.proof};};
  function frame(now,metadata){
-  const proof=window.proof;proof.frameCallbacks++;if(proof.firstMediaTime===null)proof.firstMediaTime=metadata.mediaTime;
+  const proof=window.proof;if(proof.fatal)return;proof.frameCallbacks++;
+  const hasExpected=Number(expected.width)>0&&Number(expected.height)>0;
+  proof.width=metadata.width;proof.height=metadata.height;proof.videoWidth=video.videoWidth;proof.videoHeight=video.videoHeight;
+  proof.frameDimensionsMatch=hasExpected&&metadata.width===expected.width&&metadata.height===expected.height;
+  if(hasExpected&&(!proof.frameDimensionsMatch||video.videoWidth!==expected.width||video.videoHeight!==expected.height)){proof.frameResolutionMismatch=true;fatal('DECODED_RESOLUTION_MISMATCH');return;}
+  if(lockedLevel===null||hls.currentLevel!==lockedLevel||hls.autoLevelEnabled){proof.qualityFallback=true;fatal('QUALITY_FALLBACK_DETECTED');return;}
+  if(proof.firstMediaTime===null){proof.firstMediaTime=metadata.mediaTime;firstFrameWall=now;}
+  else{const gap=metadata.mediaTime-proof.lastMediaTime;proof.maxMediaTimeGap=Math.max(proof.maxMediaTimeGap,gap);if(gap<0||gap>0.5){proof.timelineDiscontinuity=true;fatal('DECODED_TIMELINE_DISCONTINUITY');return;}}
   proof.lastMediaTime=metadata.mediaTime;proof.decodedSeconds=proof.lastMediaTime-proof.firstMediaTime;
-  proof.width=video.videoWidth;proof.height=video.videoHeight;
-  proof.passed=proof.frameCallbacks>=20&&proof.decodedSeconds>=3&&proof.width>0&&proof.height>0;
+  proof.decodedWallSeconds=(now-firstFrameWall)/1000;proof.manualQualityLocked=!hls.autoLevelEnabled;
+  proof.passed=proof.frameCallbacks>=20&&proof.decodedSeconds>=seconds&&proof.decodedWallSeconds>=seconds-0.25&&proof.width>0&&proof.height>0&&proof.manualQualityLocked&&!proof.fatal;
   status.textContent='Decoded '+proof.decodedSeconds.toFixed(3)+' seconds; '+proof.frameCallbacks+' displayed frames; '+proof.width+' × '+proof.height+'.';
   if(proof.passed){video.pause();hls.stopLoad();}else video.requestVideoFrameCallback(frame);
  }
  video.requestVideoFrameCallback(frame);
  hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){window.proof.fatal={type:String(data.type).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,100),details:String(data.details).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,100),status:Number(data.response?.code)||null};status.textContent='Playback failed.';}});
- hls.on(Hls.Events.MANIFEST_PARSED,()=>{hls.currentLevel=0;hls.nextLevel=0;hls.startLoad(0);video.play().catch(()=>{window.proof.fatal={type:'play',details:'AUTOPLAY_REJECTED'};});});
+ hls.on(Hls.Events.LEVEL_SWITCHING,(_,data)=>{if(lockedLevel!==null&&data.level!==lockedLevel){window.proof.qualityFallback=true;fatal('QUALITY_FALLBACK_DETECTED');}});
+ hls.on(Hls.Events.MANIFEST_PARSED,()=>{
+  if(quality==='highest'&&!(expected.width>0&&expected.height>0)){fatal('EXPECTED_RESOLUTION_UNAVAILABLE');return;}
+  const matches=hls.levels.map((level,index)=>({level,index})).filter(({level})=>(!(expected.width>0&&expected.height>0)||(level.width===expected.width&&level.height===expected.height))&&(!(expected.bandwidth>0)||level.bitrate===expected.bandwidth));
+  if(matches.length!==1){fatal(matches.length?'AMBIGUOUS_SELECTED_VARIANT':'SELECTED_VARIANT_NOT_AVAILABLE_IN_BROWSER');return;}
+  const {level,index}=matches[0];lockedLevel=index;window.proof.selectedLevel={index,width:level.width||null,height:level.height||null,bandwidth:level.bitrate||null};
+  hls.startLevel=index;hls.loadLevel=index;hls.nextLoadLevel=index;hls.currentLevel=index;hls.nextLevel=index;hls.autoLevelCapping=index;
+  window.proof.manualQualityLocked=!hls.autoLevelEnabled;
+  if(!window.proof.manualQualityLocked){fatal('MANUAL_QUALITY_LOCK_FAILED');return;}
+  hls.startLoad(0);video.play().catch(()=>{window.proof.fatal={type:'play',details:'AUTOPLAY_REJECTED'};});
+ });
  hls.loadSource(source);hls.attachMedia(video);
 };</script>`;
 
-async function browserProof(source, origin, out) {
+async function browserProof(source, origin, out, options, expected) {
   const proof = { passed: false, method: 'Playwright Chromium + hls.js 1.7.3 + requestVideoFrameCallback', mediaResponses: [], failedRequests: [] };
   let browser, server;
   try {
@@ -276,15 +338,17 @@ async function browserProof(source, origin, out) {
       if (url.origin === origin && proof.failedRequests.length < 20) proof.failedRequests.push({ code: safeCode(request.failure()?.errorText || 'NETWORK_FAILURE') });
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'load' });
-    await page.evaluate(value => window.startValidation(value), source);
-    try { await page.waitForFunction(() => window.proof.passed || window.proof.fatal, undefined, { timeout: 90_000 }); }
+    await page.evaluate(value => window.startValidation(value), { source, ...options, expected });
+    try { await page.waitForFunction(() => window.proof.passed || window.proof.fatal, undefined, { timeout: 90_000 + options.seconds * 1000 }); }
     catch { proof.reason = 'BROWSER_DECODE_TIMEOUT'; }
-    Object.assign(proof, await page.evaluate(() => ({ ...window.proof })));
-    proof.passed = Boolean(proof.passed && !proof.fatal && proof.frameCallbacks >= 20 && proof.decodedSeconds >= 3 && proof.width > 0 && proof.height > 0);
+    Object.assign(proof, await page.evaluate(() => window.snapshotProof()));
+    proof.passed = evaluateDecodedProof(proof, { ...options, expected });
+    if (!proof.passed && proof.fatal && !proof.reason) proof.reason = safeCode(proof.fatal.details);
+    if (proof.passed) delete proof.reason;
     await page.screenshot({ path: resolve(out, 'remote-player.png'), fullPage: true });
     proof.screenshot = 'remote-player.png';
     await page.evaluate(() => { document.querySelector('video').pause(); window.hls?.destroy(); });
-  } catch (error) { proof.reason = error instanceof ProofError ? error.code : 'BROWSER_VALIDATION_FAILED'; }
+  } catch (error) { proof.passed = false; proof.reason = error instanceof ProofError ? error.code : 'BROWSER_VALIDATION_FAILED'; }
   finally {
     await browser?.close().catch(() => {});
     if (server) await new Promise(accept => { server.closeAllConnections(); server.close(accept); });
@@ -292,22 +356,28 @@ async function browserProof(source, origin, out) {
   return proof;
 }
 
-export async function runRemoteValidation({ source = process.env.STREAMHUB_TEST_MEDIA_URL, out = process.env.OUT || 'verification/remote-playback' } = {}) {
+export async function runRemoteValidation({ source = process.env.STREAMHUB_TEST_MEDIA_URL, out = process.env.OUT || 'verification/remote-playback',
+  quality = process.env.STREAMHUB_TEST_QUALITY || 'lowest', seconds = process.env.STREAMHUB_TEST_SECONDS || 3 } = {}) {
   const directory = resolve(out);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const result = { status: 'FAIL', startedAt: new Date().toISOString(), runtime: process.version,
-    runner: process.env.RUNNER_NAME || 'unspecified', publicOrigin: null, egress: null, transport: null, exposure: null, browser: null };
+    runner: process.env.RUNNER_NAME || 'unspecified', publicOrigin: null, egress: null, transport: null, exposure: null, browser: null,
+    quality: null, requiredSeconds: null };
   try {
+    const options = normalizeTestOptions({ quality, seconds });
+    result.quality = options.quality; result.requiredSeconds = options.seconds;
     const parsed = httpsUrl(source);
     const origin = parsed.origin;
     const checked = mediaUrl(parsed.href, origin, origin);
     result.publicOrigin = origin;
     result.egress = await egressProof();
-    try { result.transport = await transportProof(checked, origin); }
+    try { result.transport = await transportProof(checked, origin, options.quality); }
     catch (error) { result.transport = { passed: false, reason: error instanceof ProofError ? error.code : 'TRANSPORT_VALIDATION_FAILED' }; }
     try { result.exposure = await exposureProof(origin); }
     catch (error) { result.exposure = { passed: false, reason: error instanceof ProofError ? error.code : 'EXPOSURE_VALIDATION_FAILED' }; }
-    result.browser = await browserProof(checked, origin, directory);
+    result.browser = result.transport.selectedVariant
+      ? await browserProof(checked, origin, directory, options, result.transport.selectedVariant)
+      : { passed: false, reason: 'NO_VALIDATED_VARIANT_AVAILABLE' };
     if (result.transport.passed && result.exposure.passed && result.browser.passed) result.status = 'PASS';
   } catch (error) { result.reason = error instanceof ProofError ? error.code : 'REMOTE_VALIDATION_FAILED'; }
   result.finishedAt = new Date().toISOString();
@@ -319,6 +389,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   try {
     const result = await runRemoteValidation();
     console.log(JSON.stringify({ status: result.status, ip: result.egress?.ip, asns: result.egress?.asns,
+      quality: result.quality, requiredSeconds: result.requiredSeconds, selectedVariant: result.transport?.selectedVariant || null,
       transport: result.transport?.passed || false, exposure: result.exposure?.passed || false,
       browser: result.browser?.passed || false, decodedSeconds: result.browser?.decodedSeconds || 0,
       frames: result.browser?.frameCallbacks || 0, width: result.browser?.width || 0, height: result.browser?.height || 0,
