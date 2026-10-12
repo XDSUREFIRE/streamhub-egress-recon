@@ -1,0 +1,45 @@
+name: Vsembed egress probe
+on:
+  push:
+    paths:
+      - .github/workflows/egress-probe.yml
+  workflow_dispatch:
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Capture runner network and root/embed responses
+        shell: bash
+        run: |
+          set -u
+          date -u +'%Y-%m-%dT%H:%M:%SZ'
+          printf 'runner_os=%s runner_arch=%s image_os=%s image_version=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "$ImageOS" "$ImageVersion"
+          curl --version | head -n 2
+          runner_ip=$(curl -4 --silent --show-error --max-time 15 https://api.ipify.org)
+          printf '\nrunner_egress_ip=%s\n' "$runner_ip"
+          curl -4 --silent --show-error --max-time 15 "https://stat.ripe.net/data/network-info/data.json?resource=$runner_ip"
+          printf '\n'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.7922.34 Safari/537.36'
+          for profile in default browser; do
+            for path in / /embed/movie/550/; do
+              url="https://vsembed.ru$path"
+              printf '\nPROFILE=%s URL=%s\n' "$profile" "$url"
+              opts=()
+              if [ "$profile" = browser ]; then
+                opts=(-A "$ua" -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' -H 'Accept-Language: en-US,en;q=0.9' -H 'sec-ch-ua: "Chromium";v="151", "Not=A?Brand";v="99", "Google Chrome";v="151"' -H 'sec-ch-ua-mobile: ?0' -H 'sec-ch-ua-platform: "Windows"' -H 'Referer: https://vidsrc.to/')
+              fi
+              curl -4 --silent --show-error --location --max-redirs 3 --connect-timeout 10 --max-time 25 "${opts[@]}" --dump-header response-headers.txt --output response-body.html --write-out 'http_code=%{http_code}\nremote_ip=%{remote_ip}\nurl_effective=%{url_effective}\n' "$url"
+              printf 'curl_exit=%s\n' "$?"
+              printf 'RESPONSE_HEADERS\n'
+              cat response-headers.txt
+              printf 'BODY_LENGTH\n'
+              wc -c < response-body.html
+              printf 'TITLE_AND_BLOCK_MARKERS\n'
+              grep -Eio '<title[^>]*>[^<]*|<h1[^>]*>[^<]*|Error (code )?[0-9]{4}|cf-mitigated|_cf_chl_opt|/cdn-cgi/challenge-platform/|cf-turnstile|turnstile.render|data-api="[^"]*"' response-body.html | head -n 15 || true
+              printf 'BODY_PREFIX\n'
+              head -c 1000 response-body.html
+              printf '\nEND_RESPONSE\n'
+            done
+          done
