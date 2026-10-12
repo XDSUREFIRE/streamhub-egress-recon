@@ -1,0 +1,28 @@
+name: Headless full extraction diagnostic
+on:
+  push:
+    paths: ['.github/workflows/headless-extraction.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install disposable browser tooling
+        run: |
+          npm install --no-save --package-lock=false playwright
+          npx playwright install chromium --with-deps
+      - name: Headless extraction
+        run: node scripts/headless-extraction.mjs
+      - name: Capture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-evidence
+          path: verification/headless/
+          retention-days: 3
