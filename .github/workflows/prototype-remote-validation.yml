@@ -1,0 +1,34 @@
+name: StreamHub different-network playback proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  playback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pinned browser player tools
+        run: npm install --no-save --no-audit --no-fund hls.js@1.7.3 playwright@1.64.0
+      - name: Install Chromium and system dependencies
+        run: npx playwright install --with-deps chromium
+      - name: Validate protected source from this network
+        env:
+          STREAMHUB_TEST_MEDIA_URL: ${{ secrets.STREAMHUB_TEST_MEDIA_URL }}
+          OUT: verification/remote-playback
+        run: node scripts/prototype-remote-validate.mjs
+      - name: Upload sanitized validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamhub-remote-playback-proof
+          path: verification/remote-playback/
+          if-no-files-found: warn
+          retention-days: 7
