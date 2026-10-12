@@ -1,0 +1,17 @@
+name: Full extraction diagnostic
+on:
+  push:
+    paths: ['.github/workflows/full-extraction.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Extract and validate fresh stream
+        run: node scripts/full-extraction.mjs
