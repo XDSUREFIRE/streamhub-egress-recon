@@ -2,6 +2,18 @@ name: StreamHub different-network playback proof
 
 on:
   workflow_dispatch:
+    inputs:
+      quality:
+        description: Quality to validate
+        type: choice
+        default: lowest
+        options:
+          - lowest
+          - highest
+      seconds:
+        description: Decoded playback seconds (3-60)
+        type: string
+        default: '3'
 
 permissions:
   contents: read
@@ -22,6 +34,8 @@ jobs:
       - name: Validate protected source from this network
         env:
           STREAMHUB_TEST_MEDIA_URL: ${{ secrets.STREAMHUB_TEST_MEDIA_URL }}
+          STREAMHUB_TEST_QUALITY: ${{ inputs.quality || 'lowest' }}
+          STREAMHUB_TEST_SECONDS: ${{ inputs.seconds || '3' }}
           OUT: verification/remote-playback
         run: node scripts/prototype-remote-validate.mjs
       - name: Upload sanitized validation evidence
