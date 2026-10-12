@@ -13,7 +13,9 @@ const config = (html, name) => { const marker = `window.${name} = `; const start
 async function get(label, url, referer, extra = {}, binary = false) {
   const headers = { 'User-Agent': ua, Accept: '*/*', 'Accept-Language': 'en-US,en;q=0.9', ...(referer ? { Referer: new URL(referer).origin + '/' } : {}), ...extra };
   let r;
-  if (process.env.PROBE_TRANSPORT === 'curl') {
+  if (globalThis.probeBrowserFetch) {
+    r = await globalThis.probeBrowserFetch(clean(url), headers);
+  } else if (process.env.PROBE_TRANSPORT === 'curl') {
     const dir = mkdtempSync(join(tmpdir(), 'streamhub-probe-'));
     try {
       const args = ['--silent','--show-error','--location','--max-time','25','--dump-header',join(dir,'headers'),'--output',join(dir,'body'),'--write-out','%{http_code}\n%{url_effective}'];
