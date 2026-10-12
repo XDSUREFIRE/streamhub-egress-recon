@@ -14,4 +14,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Extract and validate fresh stream
+        env:
+          PROBE_TRANSPORT: curl
         run: node scripts/full-extraction.mjs
